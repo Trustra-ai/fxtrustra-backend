@@ -1,175 +1,231 @@
+// server.js
+require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-require('dotenv').config();
+const helmet = require('helmet');
+const mongoSanitize = require('express-mongo-sanitize');
+const xss = require('xss-clean');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 
-// Middleware
-app.use(express.json());
+/* ======================= ENV VALIDATION ======================= */
+const requiredEnv = ['JWT_SECRET', 'MONGO_URI'];
+const missingEnv = requiredEnv.filter(env => !process.env[env]);
+
+if (missingEnv.length > 0) {
+  console.error(`❌ Missing required environment variables: ${missingEnv.join(', ')}`);
+  process.exit(1);
+}
+
+/* ======================= SECURITY MIDDLEWARE ======================= */
+app.set('trust proxy', 1);
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      scriptSrc: ["'self'"],
+    },
+  },
+}));
+app.use(express.json({ limit: '10kb' }));
+app.use(mongoSanitize());
+app.use(xss());
+
+/* ======================= RATE LIMITING ======================= */
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // 10 attempts per window per IP
+  message: { error: 'Too many attempts, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use('/api/register', authLimiter);
+app.use('/api/login', authLimiter);
+
+/* ======================= CORS ======================= */
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : ['https://fxtrustra-frontend.vercel.app'];
+
 app.use(cors({
-  origin: '*',
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
 }));
 
-// MongoDB Connection
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('MongoDB connected successfully'))
-  .catch(err => console.log('MongoDB connection error:', err));
+/* ======================= HTTPS REDIRECT (Production) ======================= */
+if (process.env.NODE_ENV === 'production') {
+  app.use((req, res, next) => {
+    if (req.header('x-forwarded-proto') !== 'https') {
+      return res.redirect(301, `https://\( {req.header('host')} \){req.url}`);
+    }
+    next();
+  });
+}
 
-// User Schema
-const userSchema = new mongoose.Schema({
-  username: { type: String, required: true, unique: true, trim: true },
-  email: { type: String, required: true, unique: true, trim: true, lowercase: true },
-  password: { type: String, required: true },
-  role: { type: String, enum: ['user', 'admin'], default: 'user' },
-  createdAt: { type: Date, default: Date.now },
+/* ======================= DATABASE CONNECTION ======================= */
+mongoose
+  .connect(process.env.MONGO_URI) // Mongoose 8+ — no options needed
+  .then(() => console.log('✅ MongoDB connected successfully'))
+  .catch(err => {
+    console.error('❌ MongoDB connection failed:', err.message);
+    process.exit(1);
+  });
+
+mongoose.connection.on('error', err => {
+  console.error('MongoDB connection error:', err);
 });
+
+/* ======================= HEALTH CHECK ======================= */
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ message: 'ok', timestamp: new Date().toISOString() });
+});
+
+/* ======================= VALIDATION HELPERS ======================= */
+const validateEmail = (email) => {
+  const re = /^[a-zA-Z0-9.!#\( %&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)* \)/;
+  return re.test(String(email).toLowerCase());
+};
+
+const validatePassword = (password) => {
+  const re = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@\( !%*?&])[A-Za-z\d@ \)!%*?&]{8,}$/;
+  return re.test(password);
+};
+
+/* ======================= USER SCHEMA ======================= */
+const userSchema = new mongoose.Schema(
+  {
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+    },
+    password: {
+      type: String,
+      required: true,
+    },
+    isActive: {
+      type: Boolean,
+      default: true,
+    },
+  },
+  { timestamps: true }
+);
 
 const User = mongoose.model('User', userSchema);
 
-// JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'fxtrustra_super_secure_secret_2025';
-
-// Register Route
+/* ======================= REGISTER ROUTE ======================= */
 app.post('/api/register', async (req, res) => {
-  const { username, email, password } = req.body;
-
-  if (!username || !email || !password) {
-    return res.status(400).json({ message: 'All fields are required' });
-  }
-
   try {
-    const existingUser = await User.findOne({
-      $or: [{ username }, { email }]
-    });
+    const { email, password } = req.body;
 
-    if (existingUser) {
-      if (existingUser.username === username) {
-        return res.status(400).json({ message: 'Username already exists' });
-      }
-      return res.status(400).json({ message: 'Email already registered' });
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
+    if (!validateEmail(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
 
-    const newUser = new User({
-      username,
-      email,
-      password: hashedPassword,
-      role: username.toLowerCase() === 'admin' ? 'admin' : 'user'
-    });
+    if (!validatePassword(password)) {
+      return res.status(400).json({
+        error: 'Password must be at least 8 characters and contain uppercase, lowercase, number, and special character',
+      });
+    }
 
-    await newUser.save();
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email already in use' });
+    }
 
-    res.status(201).json({
-      message: 'Registration successful',
-      user: {
-        id: newUser._id,
-        username: newUser.username,
-        email: newUser.email,
-        role: newUser.role
-      }
-    });
+    const hashedPassword = await bcrypt.hash(password, 12);
+    const user = new User({ email, password: hashedPassword });
+    await user.save();
 
-  } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ message: 'Server error during registration' });
+    res.status(201).json({ message: 'User registered successfully' });
+  } catch (err) {
+    console.error('Register error:', err);
+
+    if (err.code === 11000) {
+      return res.status(400).json({ error: 'Email already in use' });
+    }
+
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Login Route
+/* ======================= LOGIN ROUTE ======================= */
 app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
-
-  if (!username || !password) {
-    return res.status(400).json({ message: 'Username and password are required' });
-  }
-
   try {
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.status(400).json({ message: 'Invalid credentials' });
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ message: 'Invalid credentials' });
+    if (!validateEmail(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    const user = await User.findOne({ email, isActive: true });
+    const isValid = user && (await bcrypt.compare(password, user.password));
+
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const token = jwt.sign(
-      { id: user._id, username: user.username, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '7d' }
+      { id: user._id },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
     );
 
-    res.json({
-      message: 'Login successful',
-      token,
-      user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role
-      }
-    });
+    // Return JWT in JSON body (standard for mobile/SPA apps)
+    res.json({ token });
 
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ message: 'Server error during login' });
+    // Optional: Use httpOnly cookie instead (uncomment if preferred)
+    // res.cookie('token', token, {
+    //   httpOnly: true,
+    //   secure: process.env.NODE_ENV === 'production',
+    //   sameSite: 'strict',
+    //   maxAge: 60 * 60 * 1000,
+    // });
+    // res.json({ message: 'Login successful' });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Auth Middleware
-const authenticate = (req, res, next) => {
-  const token = req.header('Authorization')?.replace('Bearer ', '');
-
-  if (!token) {
-    return res.status(401).json({ message: 'No token provided' });
-  }
-
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (error) {
-    res.status(401).json({ message: 'Invalid or expired token' });
-  }
-};
-
-// Admin Middleware
-const isAdmin = (req, res, next) => {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ message: 'Admin access required' });
-  }
-  next();
-};
-
-// Protected Routes
-app.get('/api/dashboard', authenticate, (req, res) => {
-  res.json({
-    message: `Welcome to FxTrustra, ${req.user.username}!`,
-    role: req.user.role
-  });
+/* ======================= 404 HANDLER ======================= */
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Route not found' });
 });
 
-app.get('/api/admin/users', authenticate, isAdmin, async (req, res) => {
-  try {
-    const users = await User.find().select('-password');
-    res.json(users);
-  } catch (error) {
-    res.status(500).json({ message: 'Error fetching users' });
-  }
+/* ======================= GLOBAL ERROR HANDLER ======================= */
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Something went wrong' });
 });
 
-// Root
-app.get('/', (req, res) => {
-  res.send('<h1>FxTrustra Backend API is running 🚀</h1>');
-});
+/* ======================= START SERVER ======================= */
+const PORT = process.env.PORT || 5000;
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`FxTrustra server running on port ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
